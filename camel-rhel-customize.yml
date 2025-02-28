@@ -1,0 +1,6 @@
+---
+- name: Install necessary packages and setup environment
+  hosts: all
+  roles: 
+    - dependency-configuration
+

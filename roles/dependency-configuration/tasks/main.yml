@@ -1,0 +1,150 @@
+---
+- name: Install required packages
+  yum:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - git
+    - wget
+    - curl
+    - nfs-utils
+    - unzip
+    - yum-utils
+
+- name: Create NFS directory
+  become: yes
+  file:
+    path: "/var/fuse-qe-jenkins"
+    state: directory
+
+- name: Mount NFS
+  mount:
+    fstype: nfs
+    opts: rw,nolock
+    src: "ntap-rdu2-c03-prod01-nfs03a.neta-002.prod.rdu2.dc.redhat.com:/cij_001_data_prod_001_nfs"
+    path: "/var/fuse-qe-jenkins"
+    state: mounted
+
+- name: Set Java Version Based on Product Name
+  set_fact:
+    java_version: "{{ '17' if product_name == 'CSB' else '21' if product_name == 'CEQ' }}"
+
+- name: Install Java JDK
+  yum:
+    name: "java-{{ java_version }}-openjdk-devel"
+    state: present
+
+- name: Get JDK Path
+  shell: "ls /usr/lib/jvm/ | grep -P '^(?=.*java-{{ java_version }})(?=.*{{ ansible_architecture }})'"
+  register: jdk_path_output
+  changed_when: false
+
+- name: Set JAVA_HOME
+  set_fact:
+    JAVA_HOME: "/usr/lib/jvm/{{ jdk_path_output.stdout }}"
+
+- name: Get JRE Path
+  shell: "ls /usr/lib/jvm/ | grep -P '^(?=.*jre-{{ java_version }})(?=.*{{ ansible_architecture }})'"
+  register: jre_path_output
+  changed_when: false
+
+- name: Set JRE_HOME
+  set_fact:
+    JRE_HOME: "/usr/lib/jvm/{{ jre_path_output.stdout }}"
+
+- name: Install Apache Maven
+  vars:
+    maven_version: "3.9.6"
+  block:
+    - name: Download Apache Maven
+      get_url:
+        url: "https://dlcdn.apache.org/maven/maven-3/{{ maven_version }}/binaries/apache-maven-{{ maven_version }}-bin.tar.gz"
+        dest: "/tmp/apache-maven-{{ maven_version }}-bin.tar.gz"
+
+    - name: Extract Apache Maven
+      unarchive:
+        src: /tmp/apache-maven-{{ maven_version }}-bin.tar.gz
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Move Apache Maven to /var/maven
+      command:
+        cmd: mv /tmp/apache-maven-{{ maven_version }} /var/maven
+
+    - name: Append Maven environment variables to shell profile
+      blockinfile:
+        path: ~/.bashrc  # or ~/.bash_profile, ~/.profile, etc.
+        block: |
+          export M2_HOME=/var/maven
+          export PATH=$PATH:/var/maven/apache-maven-{{ maven_version }}/bin
+
+    - name: Source shell profile
+      command:
+        cmd: ln -s apache-maven-3.9.6 apache-maven-3.9.0 
+  
+    - name: Create soft link to link installed maven version with default maven version in pipeline
+      shell: source ~/.bashrc  # or source ~/.bash_profile, source ~/.profile, etc.
+      args:
+        executable: /bin/bash
+
+- name: Install Docker
+  shell: |
+    yum-config-manager -q --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    yum install -y -q docker-ce docker-ce-cli containerd.io
+    systemctl start docker
+
+- name: Download and install OpenShift client
+  get_url:
+    url: "https://mirror.openshift.com/pub/openshift-v4/ppc64le/clients/ocp/stable-4.15/openshift-client-linux.tar.gz"
+    dest: "/tmp/openshift-client-linux.tar.gz"
+
+- name: Extract OpenShift client
+  unarchive:
+    src: "/tmp/openshift-client-linux.tar.gz"
+    dest: "/tmp"
+    remote_src: yes
+    creates: "/tmp/oc"
+
+- name: Move OpenShift client to /usr/local/bin
+  command: mv "/tmp/oc" "/usr/local/bin/"
+      
+- name: Move kubectl to /usr/local/bin
+  command: mv "/tmp/kubectl" "/usr/local/bin/"
+
+- name: Configure OC Bash completion
+  shell: |
+    oc completion bash > /etc/bash_completion.d/oc_bash_completion
+  become: yes
+
+- name: Download all certificates using curl
+  shell: |
+    curl --insecure -o /etc/pki/ca-trust/source/anchors/RedHat-IT-Root-CA.crt https://password.corp.redhat.com/RH-IT-Root-CA.crt &&
+    curl --insecure -o /etc/pki/ca-trust/source/anchors/RedHat-legacy.crt https://password.corp.redhat.com/legacy.crt &&
+    curl --insecure -o /etc/pki/ca-trust/source/anchors/RedHat-Eng-CA.crt https://engineering.redhat.com/Eng-CA.crt 
+  ignore_errors: yes
+
+- name: Extract trust using update-ca-trust
+  command: update-ca-trust extract
+  become: yes
+
+- name: Download all certificates related PEM files
+  shell: |
+    curl https://certs.corp.redhat.com/certs/2015-IT-Root-CA.pem > /etc/pki/ca-trust/source/anchors/2015-IT-Root-CA.pem &&
+    curl https://certs.corp.redhat.com/certs/2022-IT-Root-CA.pem > /etc/pki/ca-trust/source/anchors/2022-IT-Root-CA.pem  
+
+- name: Run update-ca-trust 
+  command: update-ca-trust
+  become: yes
+ 
+- name: Create user jenkins
+  user:
+    name: jenkins
+   
+- name: Add id_rsa pub key into authorized_keys
+  blockinfile:
+    path: ~/.ssh/authorized_keys
+    marker: "# {mark} COMMENT"
+    block: |
+           #jenkins
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCmNOlRmBPU0CToSaoPK4zq3MdnNWHKGKUGkvad/MsCyKJgqqQJZHplMCfcI2SYkgf0F5ZB3DpmsvicUnbn6ViC/j1tTv7HpoQtEzQJv3BIW1lLmnhp9PENlvyFUF58ywf2ceLkq+SJgCOhpFVcOmKsyVnoGAqHqlaSDYAQRmfRK2QAhh2u3SfXYkucORf+cgCU4RicT4PbGHNUH26uhHt4Nk7hbGkvewZ8KoDI+z0haaEjTl0dcQtj/mJMwdpnzv2M5Lmh0hgU6XgCHhPzRiEDo1YUcbRKuU8gP2af2ugt9jS1Dk/OPiLKATpMwLXx2BfG/A558yXnO9FlBX6vAKvH2GX4HOV++VNTUygA9HCu/nsJLVwpDLDbGD59/66fIJGSp/tQyncxPW8beYSwbTEIi87QxfuDQLmaR42LAW8y3dKtPJJfRLmykHC4QjxP62fqV0v9P+iJ2glgFnU5Aw8ajLbv8WU3xPlY513f39chATjx4CZrZvsNvdxcXAITKws= root@rhv-ppc64le-8.hosts.qa.psi.rdu2.redhat.com
+    create: yes
